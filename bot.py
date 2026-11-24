@@ -22,7 +22,7 @@ CHAT_ID = os.environ["CHAT_ID"].strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 PORTFOLIO_URL = "https://drive.google.com/drive/folders/1U95AXfkSEJVsAl4p5Rr3-AHVvGMjSIH5?usp=drive_link"
-MAX_POST_AGE_HOURS = 48  # Игнорировать посты старше 48 часов (можно поставить 24)
+MAX_POST_AGE_HOURS = 48  # Игнорировать посты старше 48 часов
 
 CHANNELS_FILE = Path("channels.txt")
 SEEN_FILE = Path("seen_posts.json")
@@ -44,8 +44,8 @@ EXCLUDE_KEYWORDS = [
     "я видеомонтажер", "я видеомонтажёр", "я рилсмейкер", "монтирую в ", "работаю в ",
     "владею программами", "свободен для заказов", "свободна для заказов",
     "открыт к предложениям", "открыта к предложениям", "ищу клиентов",
-    "выездная съемка", "выездная съёмка", "работа в офисе", "в офис",
-    "съёмка в москве", "съемка в москве", "выезд по москве",
+    "выездная съемка", "выездная съёмка", "работа в офисе", "в офис", "офис в москве",
+    "гибрид", "съёмка в москве", "съемка в москве", "выезд по москве",
     "на постоянной основе в офис", "оператор-постановщик", "оплата звездами",
     "звёздами", "200 роликов", "вакансия закрыта", "исполнитель найден", "не актуально"
 ]
@@ -135,7 +135,7 @@ def analyze_with_gemini(text: str) -> dict | None:
     prompt = f"""Ты ассистент фриланс-видеомонтажёра и моушн-дизайнера Никиты (работает удалённо в DaVinci Resolve Studio, Premiere Pro, After Effects; умеет делать динамичные Reels/Shorts, длинные YouTube/обучающие видео, планарный трекинг экранов, интерактивную инфографику и AI-ролики).
 
 Проанализируй пост из Telegram-канала и верни строгий JSON с полями:
-- "is_job": true, если автор ИЩЕТ исполнителя на актуальный удалённый монтаж видео, Reels/Shorts, моушн-дизайн или AI-видео. Верни false, если это резюме/самореклама самого монтажёра, закрытая/неактуальная вакансия, оффлайн-съёмка в конкретном городе, вакансия не по видео или явный спам.
+- "is_job": true, если автор ИЩЕТ исполнителя на актуальный удалённый монтаж видео, Reels/Shorts, моушн-дизайн или AI-видео. Верни false, если это резюме/самореклама самого монтажёра, закрытая/неактуальная вакансия, оффлайн-съёмка или гибрид в офисе, вакансия не по видео или явный спам.
 - "category": короткая категория (например: "Вертикальные видео (Reels/Shorts)", "YouTube / Длинные видео", "Моушн / Графика / VFX", "AI-видео").
 - "budget": точный бюджет из текста или "не указан".
 - "summary": суть задачи в 1-2 коротких предложениях без воды.
@@ -148,7 +148,6 @@ def analyze_with_gemini(text: str) -> dict | None:
 Текст поста:
 {text[:2500]}"""
 
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
@@ -161,17 +160,25 @@ def analyze_with_gemini(text: str) -> dict | None:
         }
     }
 
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=(5, 20))
-        if r.status_code != 200:
-            print(f"[WARN] Gemini API HTTP {r.status_code}: {r.text[:200]}")
+    models = ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=(5, 20))
+            if r.status_code == 404:
+                continue
+            if r.status_code != 200:
+                print(f"[WARN] Gemini ({model}) HTTP {r.status_code}: {r.text[:200]}")
+                return None
+            data = r.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(raw_text)
+        except Exception as e:
+            print(f"[WARN] Gemini ({model}) ошибка: {e}")
             return None
-        data = r.json()
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(raw_text)
-    except Exception as e:
-        print(f"[WARN] Gemini ошибка: {e}")
-        return None
+
+    print("[WARN] Ни одна из моделей Gemini не ответила")
+    return None
 
 
 def detect_category(text: str) -> str:
@@ -308,7 +315,6 @@ def main() -> None:
                 continue
             seen_set.add(post["id"])
 
-            # Отсекаем всё, что опубликовано раньше MAX_POST_AGE_HOURS часов назад
             if post["dt"] is not None:
                 age_hours = (now_utc - post["dt"]).total_seconds() / 3600
                 if age_hours > MAX_POST_AGE_HOURS:
@@ -323,7 +329,6 @@ def main() -> None:
 
         time.sleep(0.5)
 
-    # Ограничиваем до 8 самых свежих постов за один запуск
     if len(candidates) > 8:
         for skipped in candidates[:-8]:
             ids_to_save.append(skipped["id"])
