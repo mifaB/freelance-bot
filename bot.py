@@ -2,13 +2,21 @@ import html
 import json
 import os
 import re
+import socket
 import time
 from pathlib import Path
 from bs4 import BeautifulSoup
 import requests
+import urllib3.util.connection as urllib3_cn
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+# Принудительно используем IPv4, чтобы запросы с GitHub к Telegram не зависали
+try:
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
+
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+CHAT_ID = os.environ["CHAT_ID"].strip()
 
 CHANNELS_FILE = Path("channels.txt")
 SEEN_FILE = Path("seen_posts.json")
@@ -62,7 +70,7 @@ def save_seen(seen: list[str]) -> None:
 
 def fetch_channel_posts(channel: str) -> list[dict]:
     url = f"https://t.me/s/{channel}"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp = requests.get(url, headers=HEADERS, timeout=25)
     if resp.status_code != 200:
         print(f"[WARN] {channel}: HTTP {resp.status_code}")
         return []
@@ -152,7 +160,7 @@ def extract_contact(text: str, links: list[str], channel: str) -> str | None:
     return None
 
 
-def send_card(post: dict) -> None:
+def send_card(post: dict) -> bool:
     text = post["text"]
     category = detect_category(text)
     budget = extract_budget(text)
@@ -187,13 +195,18 @@ def send_card(post: dict) -> None:
         "reply_markup": {"inline_keyboard": [buttons]}
     }
 
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json=payload,
-        timeout=15
-    )
-    if r.status_code != 200:
-        print(f"[ERR] Telegram API: {r.text}")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(url, json=payload, timeout=30)
+            if r.status_code == 200:
+                return True
+            print(f"[ERR] Telegram API (попытка {attempt}): {r.status_code} {r.text}")
+        except requests.RequestException as e:
+            print(f"[WARN] Сеть Telegram (попытка {attempt}/3): {e}")
+        time.sleep(3 * attempt)
+
+    return False
 
 
 def main() -> None:
@@ -202,7 +215,7 @@ def main() -> None:
     seen_set = set(seen_list)
 
     new_relevant = []
-    new_ids = []
+    ids_to_save = []
 
     for channel in channels:
         try:
@@ -215,23 +228,32 @@ def main() -> None:
             if post["id"] in seen_set:
                 continue
             seen_set.add(post["id"])
-            new_ids.append(post["id"])
             if is_relevant(post["text"]):
                 new_relevant.append(post)
+            else:
+                ids_to_save.append(post["id"])
 
         time.sleep(1)
 
-    to_send = new_relevant[-5:] if is_first_run else new_relevant
+    if is_first_run and len(new_relevant) > 5:
+        for skipped in new_relevant[:-5]:
+            ids_to_save.append(skipped["id"])
+        to_send = new_relevant[-5:]
+    else:
+        to_send = new_relevant
 
+    sent_count = 0
     for post in to_send:
-        send_card(post)
-        time.sleep(0.5)
+        if send_card(post):
+            ids_to_save.append(post["id"])
+            sent_count += 1
+        time.sleep(1)
 
-    if new_ids:
-        seen_list.extend(new_ids)
+    if ids_to_save:
+        seen_list.extend(ids_to_save)
         save_seen(seen_list)
 
-    print(f"Проверено каналов: {len(channels)} | Новых постов: {len(new_ids)} | Отправлено: {len(to_send)}")
+    print(f"Проверено каналов: {len(channels)} | Подходящих: {len(new_relevant)} | Отправлено: {sent_count}")
 
 
 if __name__ == "__main__":
