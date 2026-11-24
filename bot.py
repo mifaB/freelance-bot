@@ -7,16 +7,20 @@ import time
 from pathlib import Path
 from bs4 import BeautifulSoup
 import requests
-import urllib3.util.connection as urllib3_cn
 
-# Принудительно используем IPv4, чтобы запросы с GitHub к Telegram не зависали
-try:
-    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
-except Exception:
-    pass
+# Жёстко используем IPv4, чтобы запросы с GitHub к Telegram не зависали
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(*args, **kwargs):
+    res = _orig_getaddrinfo(*args, **kwargs)
+    ipv4 = [r for r in res if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else res
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 CHAT_ID = os.environ["CHAT_ID"].strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+
+PORTFOLIO_URL = "https://drive.google.com/drive/folders/1U95AXfkSEJVsAl4p5Rr3-AHVvGMjSIH5?usp=drive_link"
 
 CHANNELS_FILE = Path("channels.txt")
 SEEN_FILE = Path("seen_posts.json")
@@ -42,7 +46,6 @@ EXCLUDE_KEYWORDS = [
     "съёмка в москве", "съемка в москве", "выезд по москве",
     "на постоянной основе в офис", "оператор-постановщик", "оплата звездами",
     "звёздами", "200 роликов"
-]
 ]
 
 HEADERS = {
@@ -78,7 +81,7 @@ def save_seen(seen: list[str]) -> None:
 
 def fetch_channel_posts(channel: str) -> list[dict]:
     url = f"https://t.me/s/{channel}"
-    resp = requests.get(url, headers=HEADERS, timeout=25)
+    resp = requests.get(url, headers=HEADERS, timeout=(5, 15))
     if resp.status_code != 200:
         print(f"[WARN] {channel}: HTTP {resp.status_code}")
         return []
@@ -106,22 +109,68 @@ def fetch_channel_posts(channel: str) -> list[dict]:
     return posts
 
 
-def is_relevant(text: str) -> bool:
+def is_relevant_basic(text: str) -> bool:
     low = text.lower()
     if any(bad in low for bad in EXCLUDE_KEYWORDS):
         return False
     return any(good in low for good in INCLUDE_KEYWORDS)
 
 
+def analyze_with_gemini(text: str) -> dict | None:
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt = f"""Ты ассистент фриланс-видеомонтажёра и моушн-дизайнера Никиты (работает удалённо в DaVinci Resolve Studio, Premiere Pro, After Effects; умеет делать динамичные Reels/Shorts, длинные YouTube/обучающие видео, планарный трекинг экранов, интерактивную инфографику и AI-ролики).
+
+Проанализируй пост из Telegram-канала и верни строгий JSON с полями:
+- "is_job": true, если автор ИЩЕТ исполнителя на удалённый монтаж видео, Reels/Shorts, моушн-дизайн или AI-видео. Верни false, если это резюме/самореклама самого монтажёра, оффлайн-съёмка в конкретном городе, вакансия не по видео или явный спам.
+- "category": короткая категория (например: "Вертикальные видео (Reels/Shorts)", "YouTube / Длинные видео", "Моушн / Графика / VFX", "AI-видео").
+- "budget": точный бюджет из текста или "не указан".
+- "summary": суть задачи в 1-2 коротких предложениях без воды.
+- "pitch": готовый короткий отклик в ЛС заказчику (3-4 предложения, живой деловой тон без канцелярита и пафоса). В отклике:
+  1) если в посте есть кодовое слово или конкретный вопрос — ответь на него в первой же фразе;
+  2) покажи понимание именно этой задачи и релевантный софт;
+  3) вставь ссылку на портфолио: {PORTFOLIO_URL}
+  4) предложи обсудить детали или сделать короткий тестовый фрагмент.
+
+Текст поста:
+{text[:2500]}"""
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.3
+        }
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=(5, 20))
+        if r.status_code != 200:
+            print(f"[WARN] Gemini API HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        data = r.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(raw_text)
+    except Exception as e:
+        print(f"[WARN] Gemini ошибка: {e}")
+        return None
+
+
 def detect_category(text: str) -> str:
     low = text.lower()
     if any(w in low for w in ["reels", "рилс", "shorts", "шортс", "tiktok", "тикток", "вертикальн"]):
-        return "Монтаж | Вертикальные видео"
+        return "Вертикальные видео"
     if any(w in low for w in ["youtube", "ютуб", "подкаст", "интервью", "урок", "лекци", "курс"]):
-        return "Монтаж | YouTube и длинные видео"
+        return "YouTube и длинные видео"
     if any(w in low for w in ["after effects", "моушн", "трекинг", "инфографик", "vfx", "3d"]):
-        return "Монтаж | Графика и VFX"
-    return "Монтаж | Видеопродакшн"
+        return "Графика и VFX"
+    return "Видеопродакшн"
 
 
 def extract_budget(text: str) -> str:
@@ -133,24 +182,6 @@ def extract_budget(text: str) -> str:
     if match:
         return re.sub(r"\s+", " ", match.group(1)).strip()
     return "не указан"
-
-
-def extract_test_task(text: str) -> str:
-    low = text.lower()
-    if "тест" not in low:
-        return "не указано"
-    if any(w in low for w in ["бесплатное тест", "тестовое не оплач", "неоплачиваемое тест"]):
-        return "не оплачивается"
-    if any(w in low for w in ["оплачиваемое тест", "тест оплач", "тестовое оплач"]):
-        return "оплачивается"
-    return "есть (уточнить условия)"
-
-
-def extract_portfolio(text: str) -> str:
-    low = text.lower()
-    if any(w in low for w in ["портфолио", "примеры работ", "пример работ", "кейсы", "шоурил"]):
-        return "нужно"
-    return "не указано"
 
 
 def extract_contact(text: str, links: list[str], channel: str) -> str | None:
@@ -168,27 +199,37 @@ def extract_contact(text: str, links: list[str], channel: str) -> str | None:
     return None
 
 
-def send_card(post: dict) -> bool:
+def send_card(post: dict, ai: dict | None) -> bool:
     text = post["text"]
-    category = detect_category(text)
-    budget = extract_budget(text)
-    test_task = extract_test_task(text)
-    portfolio = extract_portfolio(text)
     contact = extract_contact(text, post["links"], post["channel"])
-
-    snippet = text if len(text) <= 420 else text[:417].rstrip() + "..."
-    safe_snippet = html.escape(snippet)
     contact_str = contact if contact else "см. в посте"
 
-    message = (
-        f"🎬 <b>{category}</b>\n\n"
-        f"<b>Бюджет:</b> {html.escape(budget)}\n"
-        f"<b>Тестовое:</b> {test_task}\n"
-        f"<b>Портфолио:</b> {portfolio}\n"
-        f"<b>Контакт:</b> {contact_str}\n\n"
-        f"<b>Текст:</b>\n{safe_snippet}\n\n"
-        f"<i>Источник: @{post['channel']}</i>"
-    )
+    if ai:
+        category = html.escape(str(ai.get("category") or detect_category(text)))
+        budget = html.escape(str(ai.get("budget") or extract_budget(text)))
+        summary = html.escape(str(ai.get("summary") or ""))
+        pitch = html.escape(str(ai.get("pitch") or ""))
+
+        message = (
+            f"🎬 <b>Монтаж | {category}</b>\n\n"
+            f"<b>Бюджет:</b> {budget}\n"
+            f"<b>Контакт:</b> {contact_str}\n"
+            f"<b>Суть:</b> {summary}\n\n"
+            f"<b>Готовый отклик (нажми, чтобы скопировать):</b>\n"
+            f"<code>{pitch}</code>\n\n"
+            f"<i>Источник: @{post['channel']}</i>"
+        )
+    else:
+        category = detect_category(text)
+        budget = extract_budget(text)
+        snippet = text if len(text) <= 420 else text[:417].rstrip() + "..."
+        message = (
+            f"🎬 <b>Монтаж | {category}</b>\n\n"
+            f"<b>Бюджет:</b> {html.escape(budget)}\n"
+            f"<b>Контакт:</b> {contact_str}\n\n"
+            f"<b>Текст:</b>\n{html.escape(snippet)}\n\n"
+            f"<i>Источник: @{post['channel']}</i>"
+        )
 
     buttons = []
     if contact:
@@ -206,13 +247,13 @@ def send_card(post: dict) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     for attempt in range(1, 4):
         try:
-            r = requests.post(url, json=payload, timeout=30)
+            r = requests.post(url, json=payload, timeout=(5, 10))
             if r.status_code == 200:
                 return True
             print(f"[ERR] Telegram API (попытка {attempt}): {r.status_code} {r.text}")
         except requests.RequestException as e:
             print(f"[WARN] Сеть Telegram (попытка {attempt}/3): {e}")
-        time.sleep(3 * attempt)
+        time.sleep(2 * attempt)
 
     return False
 
@@ -222,7 +263,7 @@ def main() -> None:
     seen_list, is_first_run = load_seen()
     seen_set = set(seen_list)
 
-    new_relevant = []
+    candidates = []
     ids_to_save = []
 
     for channel in channels:
@@ -236,32 +277,38 @@ def main() -> None:
             if post["id"] in seen_set:
                 continue
             seen_set.add(post["id"])
-            if is_relevant(post["text"]):
-                new_relevant.append(post)
+            if is_relevant_basic(post["text"]):
+                candidates.append(post)
             else:
                 ids_to_save.append(post["id"])
 
-        time.sleep(1)
+        time.sleep(0.5)
 
-    if is_first_run and len(new_relevant) > 5:
-        for skipped in new_relevant[:-5]:
+    # Ограничиваем до 8 постов за один запуск, чтобы не упереться в лимиты бесплатного API
+    if len(candidates) > 8:
+        for skipped in candidates[:-8]:
             ids_to_save.append(skipped["id"])
-        to_send = new_relevant[-5:]
-    else:
-        to_send = new_relevant
+        candidates = candidates[-8:]
 
     sent_count = 0
-    for post in to_send:
-        if send_card(post):
+    for post in candidates:
+        ai_result = analyze_with_gemini(post["text"])
+        if ai_result is not None and not ai_result.get("is_job", True):
+            print(f"[AI SKIP] Отсеян мусор/резюме из @{post['channel']}")
+            ids_to_save.append(post["id"])
+            continue
+
+        if send_card(post, ai_result):
             ids_to_save.append(post["id"])
             sent_count += 1
-        time.sleep(1)
+
+        time.sleep(2)
 
     if ids_to_save:
         seen_list.extend(ids_to_save)
         save_seen(seen_list)
 
-    print(f"Проверено каналов: {len(channels)} | Подходящих: {len(new_relevant)} | Отправлено: {sent_count}")
+    print(f"Проверено каналов: {len(channels)} | Кандидатов: {len(candidates)} | Отправлено: {sent_count}")
 
 
 if __name__ == "__main__":
