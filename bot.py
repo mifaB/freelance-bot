@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
@@ -21,6 +22,7 @@ CHAT_ID = os.environ["CHAT_ID"].strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 PORTFOLIO_URL = "https://drive.google.com/drive/folders/1U95AXfkSEJVsAl4p5Rr3-AHVvGMjSIH5?usp=drive_link"
+MAX_POST_AGE_HOURS = 48  # Игнорировать посты старше 48 часов (можно поставить 24)
 
 CHANNELS_FILE = Path("channels.txt")
 SEEN_FILE = Path("seen_posts.json")
@@ -45,7 +47,7 @@ EXCLUDE_KEYWORDS = [
     "выездная съемка", "выездная съёмка", "работа в офисе", "в офис",
     "съёмка в москве", "съемка в москве", "выезд по москве",
     "на постоянной основе в офис", "оператор-постановщик", "оплата звездами",
-    "звёздами", "200 роликов"
+    "звёздами", "200 роликов", "вакансия закрыта", "исполнитель найден", "не актуально"
 ]
 
 HEADERS = {
@@ -63,13 +65,13 @@ def load_channels() -> list[str]:
     ]
 
 
-def load_seen() -> tuple[list[str], bool]:
+def load_seen() -> list[str]:
     if not SEEN_FILE.exists():
-        return [], True
+        return []
     try:
-        return json.loads(SEEN_FILE.read_text(encoding="utf-8")), False
+        return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return [], True
+        return []
 
 
 def save_seen(seen: list[str]) -> None:
@@ -95,6 +97,15 @@ def fetch_channel_posts(channel: str) -> list[dict]:
         if not post_id or not text_el:
             continue
 
+        time_el = msg.select_one("time.time")
+        dt_str = time_el.get("datetime") if time_el else None
+        post_dt = None
+        if dt_str:
+            try:
+                post_dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            except ValueError:
+                post_dt = None
+
         text = text_el.get_text("\n", strip=True)
         links = [a.get("href", "") for a in text_el.select("a") if a.get("href")]
 
@@ -103,7 +114,8 @@ def fetch_channel_posts(channel: str) -> list[dict]:
             "channel": channel,
             "url": f"https://t.me/{post_id}",
             "text": text,
-            "links": links
+            "links": links,
+            "dt": post_dt
         })
 
     return posts
@@ -123,7 +135,7 @@ def analyze_with_gemini(text: str) -> dict | None:
     prompt = f"""Ты ассистент фриланс-видеомонтажёра и моушн-дизайнера Никиты (работает удалённо в DaVinci Resolve Studio, Premiere Pro, After Effects; умеет делать динамичные Reels/Shorts, длинные YouTube/обучающие видео, планарный трекинг экранов, интерактивную инфографику и AI-ролики).
 
 Проанализируй пост из Telegram-канала и верни строгий JSON с полями:
-- "is_job": true, если автор ИЩЕТ исполнителя на удалённый монтаж видео, Reels/Shorts, моушн-дизайн или AI-видео. Верни false, если это резюме/самореклама самого монтажёра, оффлайн-съёмка в конкретном городе, вакансия не по видео или явный спам.
+- "is_job": true, если автор ИЩЕТ исполнителя на актуальный удалённый монтаж видео, Reels/Shorts, моушн-дизайн или AI-видео. Верни false, если это резюме/самореклама самого монтажёра, закрытая/неактуальная вакансия, оффлайн-съёмка в конкретном городе, вакансия не по видео или явный спам.
 - "category": короткая категория (например: "Вертикальные видео (Reels/Shorts)", "YouTube / Длинные видео", "Моушн / Графика / VFX", "AI-видео").
 - "budget": точный бюджет из текста или "не указан".
 - "summary": суть задачи в 1-2 коротких предложениях без воды.
@@ -199,10 +211,24 @@ def extract_contact(text: str, links: list[str], channel: str) -> str | None:
     return None
 
 
+def format_post_time(post_dt: datetime | None) -> str:
+    if not post_dt:
+        return "неизвестно"
+    now_utc = datetime.now(timezone.utc)
+    diff_min = max(0, int((now_utc - post_dt).total_seconds() // 60))
+    if diff_min < 60:
+        ago = f"{diff_min} мин. назад"
+    else:
+        ago = f"{diff_min // 60} ч. назад"
+    msk_dt = post_dt + timedelta(hours=3)
+    return f"{msk_dt.strftime('%d.%m в %H:%M')} МСК ({ago})"
+
+
 def send_card(post: dict, ai: dict | None) -> bool:
     text = post["text"]
     contact = extract_contact(text, post["links"], post["channel"])
     contact_str = contact if contact else "см. в посте"
+    time_str = format_post_time(post.get("dt"))
 
     if ai:
         category = html.escape(str(ai.get("category") or detect_category(text)))
@@ -212,9 +238,10 @@ def send_card(post: dict, ai: dict | None) -> bool:
 
         message = (
             f"🎬 <b>Монтаж | {category}</b>\n\n"
-            f"<b>Бюджет:</b> {budget}\n"
-            f"<b>Контакт:</b> {contact_str}\n"
-            f"<b>Суть:</b> {summary}\n\n"
+            f"🕒 <b>Опубликовано:</b> {time_str}\n"
+            f"💰 <b>Бюджет:</b> {budget}\n"
+            f"👤 <b>Контакт:</b> {contact_str}\n"
+            f"📌 <b>Суть:</b> {summary}\n\n"
             f"<b>Готовый отклик (нажми, чтобы скопировать):</b>\n"
             f"<code>{pitch}</code>\n\n"
             f"<i>Источник: @{post['channel']}</i>"
@@ -225,8 +252,9 @@ def send_card(post: dict, ai: dict | None) -> bool:
         snippet = text if len(text) <= 420 else text[:417].rstrip() + "..."
         message = (
             f"🎬 <b>Монтаж | {category}</b>\n\n"
-            f"<b>Бюджет:</b> {html.escape(budget)}\n"
-            f"<b>Контакт:</b> {contact_str}\n\n"
+            f"🕒 <b>Опубликовано:</b> {time_str}\n"
+            f"💰 <b>Бюджет:</b> {html.escape(budget)}\n"
+            f"👤 <b>Контакт:</b> {contact_str}\n\n"
             f"<b>Текст:</b>\n{html.escape(snippet)}\n\n"
             f"<i>Источник: @{post['channel']}</i>"
         )
@@ -260,11 +288,13 @@ def send_card(post: dict, ai: dict | None) -> bool:
 
 def main() -> None:
     channels = load_channels()
-    seen_list, is_first_run = load_seen()
+    seen_list = load_seen()
     seen_set = set(seen_list)
+    now_utc = datetime.now(timezone.utc)
 
     candidates = []
     ids_to_save = []
+    old_skipped = 0
 
     for channel in channels:
         try:
@@ -277,6 +307,15 @@ def main() -> None:
             if post["id"] in seen_set:
                 continue
             seen_set.add(post["id"])
+
+            # Отсекаем всё, что опубликовано раньше MAX_POST_AGE_HOURS часов назад
+            if post["dt"] is not None:
+                age_hours = (now_utc - post["dt"]).total_seconds() / 3600
+                if age_hours > MAX_POST_AGE_HOURS:
+                    ids_to_save.append(post["id"])
+                    old_skipped += 1
+                    continue
+
             if is_relevant_basic(post["text"]):
                 candidates.append(post)
             else:
@@ -284,7 +323,7 @@ def main() -> None:
 
         time.sleep(0.5)
 
-    # Ограничиваем до 8 постов за один запуск, чтобы не упереться в лимиты бесплатного API
+    # Ограничиваем до 8 самых свежих постов за один запуск
     if len(candidates) > 8:
         for skipped in candidates[:-8]:
             ids_to_save.append(skipped["id"])
@@ -308,7 +347,7 @@ def main() -> None:
         seen_list.extend(ids_to_save)
         save_seen(seen_list)
 
-    print(f"Проверено каналов: {len(channels)} | Кандидатов: {len(candidates)} | Отправлено: {sent_count}")
+    print(f"Каналов: {len(channels)} | Старых отсеяно: {old_skipped} | Кандидатов: {len(candidates)} | Отправлено: {sent_count}")
 
 
 if __name__ == "__main__":
