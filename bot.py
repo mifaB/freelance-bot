@@ -56,6 +56,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
+_WORKING_MODEL: str | None = None
+
 
 def load_channels() -> list[str]:
     if not CHANNELS_FILE.exists():
@@ -133,13 +135,53 @@ def check_relevance_basic(text: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def get_text_models(headers: dict) -> list[str]:
+    preferred = [
+        "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-3-flash-preview",
+        "gemini-2.0-flash",
+    ]
+    bad_tokens = ("tts", "image", "audio", "embedding", "aqa", "bisect", "robotics", "computer-use")
+    discovered = []
+
+    try:
+        m_resp = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers=headers,
+            timeout=(5, 10)
+        )
+        if m_resp.status_code == 200:
+            for m in m_resp.json().get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                low_name = name.lower()
+                methods = m.get("supportedGenerationMethods", [])
+                if (
+                    "generateContent" in methods
+                    and "flash" in low_name
+                    and not any(bad in low_name for bad in bad_tokens)
+                ):
+                    discovered.append(name)
+    except Exception:
+        pass
+
+    ordered = []
+    if _WORKING_MODEL:
+        ordered.append(_WORKING_MODEL)
+    for m in preferred + discovered:
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
 def analyze_with_gemini(text: str) -> dict | None:
+    global _WORKING_MODEL
     if not GEMINI_API_KEY:
         return None
 
     prompt = f"""Ты ассистент фриланс-видеомонтажёра и моушн-дизайнера Никиты (работает удалённо в DaVinci Resolve Studio, Premiere Pro, After Effects; умеет делать динамичные Reels/Shorts, длинные YouTube/обучающие видео, планарный трекинг экранов, интерактивную инфографику и AI-ролики).
 
-Проанализируй пост из Telegram-канала и верни строгий JSON с полями:
+Проанализируй пост из Telegram-канала и верни строгий JSON-объект (не массив) с полями:
 - "is_job": true, если автор ИЩЕТ исполнителя на актуальный удалённый монтаж видео, Reels/Shorts, моушн-дизайн или AI-видео. Верни false, если это резюме/самореклама самого монтажёра, публикация готовых видео без монтажа, закрытая/неактуальная вакансия, оффлайн-съёмка или гибрид в офисе, вакансия не по видео или явный спам.
 - "reason": краткая причина решения (3-6 слов).
 - "category": короткая категория (например: "Вертикальные видео (Reels/Shorts)", "YouTube / Длинные видео", "Моушн / Графика / VFX", "AI-видео").
@@ -166,45 +208,35 @@ def analyze_with_gemini(text: str) -> dict | None:
         }
     }
 
-    candidate_models = []
-    try:
-        m_resp = requests.get(
-            "https://generativelanguage.googleapis.com/v1beta/models",
-            headers=headers,
-            timeout=(5, 10)
-        )
-        if m_resp.status_code == 200:
-            for m in m_resp.json().get("models", []):
-                name = m.get("name", "").replace("models/", "")
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods and "flash" in name.lower():
-                    candidate_models.append(name)
-    except Exception:
-        pass
-
-    for fallback in ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]:
-        if fallback not in candidate_models:
-            candidate_models.append(fallback)
-
-    for model in candidate_models:
+    for model in get_text_models(headers):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=(5, 20))
-            if r.status_code in (404, 429, 500, 503):
-                print(f"[WARN] {model} недоступна (HTTP {r.status_code}), пробую следующую...")
-                time.sleep(2)
+            r = requests.post(url, headers=headers, json=payload, timeout=(8, 35))
+            if r.status_code in (400, 404, 429, 500, 503):
+                print(f"[WARN] {model} пропущена (HTTP {r.status_code})")
+                if _WORKING_MODEL == model:
+                    _WORKING_MODEL = None
+                time.sleep(1)
                 continue
             if r.status_code != 200:
                 print(f"[WARN] Gemini ({model}) HTTP {r.status_code}: {r.text[:200]}")
                 continue
+
             data = r.json()
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(raw_text)
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list) and parsed:
+                parsed = parsed[0]
+            if isinstance(parsed, dict):
+                _WORKING_MODEL = model
+                return parsed
         except Exception as e:
             print(f"[WARN] Gemini ({model}) ошибка: {e}")
+            if _WORKING_MODEL == model:
+                _WORKING_MODEL = None
             time.sleep(1)
 
-    print("[WARN] Все модели Gemini временно перегружены, отправляю базовую карточку")
+    print("[WARN] Модели Gemini не ответили вовремя, отправляю базовую карточку")
     return None
 
 
@@ -264,7 +296,7 @@ def send_card(post: dict, ai: dict | None) -> bool:
     contact_str = contact if contact else "см. в посте"
     time_str = format_post_time(post.get("dt"))
 
-    if ai:
+    if isinstance(ai, dict):
         category = html.escape(str(ai.get("category") or detect_category(text)))
         budget = html.escape(str(ai.get("budget") or extract_budget(text)))
         summary = html.escape(str(ai.get("summary") or ""))
@@ -365,15 +397,18 @@ def main() -> None:
 
     sent_count = 0
     for post in candidates:
-        ai_result = analyze_with_gemini(post["text"])
-        if ai_result is not None and not ai_result.get("is_job", True):
-            print(f"[AI SKIP] @{post['channel']}: {ai_result.get('reason', 'не подходит')}")
-            ids_to_save.append(post["id"])
-            continue
+        try:
+            ai_result = analyze_with_gemini(post["text"])
+            if isinstance(ai_result, dict) and not ai_result.get("is_job", True):
+                print(f"[AI SKIP] @{post['channel']}: {ai_result.get('reason', 'не подходит')}")
+                ids_to_save.append(post["id"])
+                continue
 
-        if send_card(post, ai_result):
-            ids_to_save.append(post["id"])
-            sent_count += 1
+            if send_card(post, ai_result):
+                ids_to_save.append(post["id"])
+                sent_count += 1
+        except Exception as e:
+            print(f"[ERR] Ошибка обработки поста {post['id']}: {e}")
 
         time.sleep(2)
 
