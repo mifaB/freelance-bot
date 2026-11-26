@@ -26,3 +26,9 @@ Koteyka_Freelancer
 searcher_freelance
 vakansii_bez_boltovni
 sova_freelance
+freelancebay
+mskeventjob
+vacanciesrus
+vacancysmm
+zakaz_design
+ae_motion
